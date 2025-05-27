@@ -1,0 +1,66 @@
+services:
+  llm:
+    build:
+      context: .
+      # Specify user and group IDs for the llmuser during build if needed by Dockerfile
+      # args:
+      #   UID: 1000
+      #   GID: 1000
+    image: llm-secure-wrapper # You can tag the image if you like
+    container_name: llm_container
+    volumes:
+      # Working directory - where user can read/write
+      - .:/workspace:rw
+      # Isolated config - persistent but isolated
+      - llm-config:/home/llmuser/.config/llm
+      # Optional: Shared prompts directory (read-only)
+      # Create a 'prompts' directory in your project root if you want to use this
+      - ./prompts:/prompts:ro
+    working_dir: /workspace
+    # Run as non-root user llmuser (UID 1000, GID 1000) defined in Dockerfile
+    # User directive in docker-compose overrides USER in Dockerfile
+    user: "1000:1000"
+    environment:
+      # API keys from host environment (ensure .env file is used or vars are exported)
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      # Pass other LLM configurations from .env file
+      - LLM_DEFAULT_MODEL
+      - LLM_DISABLE_CUSTOM_TOOLS
+    # Security: Limit capabilities
+    cap_drop:
+      - ALL
+    # cap_add: # Only add capabilities if absolutely necessary. NET_BIND_SERVICE is for running web services.
+    #   - NET_BIND_SERVICE # Not typically needed for a CLI tool unless it hosts a service.
+    # Network security: llm-network is a bridge network.
+    # For more isolation, consider 'internal: true' if no external access (e.g. to OpenAI) is needed.
+    # If API calls to OpenAI/Anthropic are needed, this network needs outbound internet access.
+    networks:
+      - llm-network
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "0.5"
+    # Healthcheck definition (matches Dockerfile HEALTHCHECK)
+    healthcheck:
+      test: ["CMD", "llm", "--version"] # Should match the CMD in Dockerfile's HEALTHCHECK
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    # Ensure the container stops if the llm command finishes
+    # For interactive use, 'tty: true' and 'stdin_open: true' are useful (often default for 'run -it')
+    tty: true # Keeps the container running for interactive commands
+    stdin_open: true # Allows attaching to stdin
+
+volumes:
+  llm-config:
+    driver: local # Use local driver for persistent config storage
+
+networks:
+  llm-network:
+    driver: bridge # Default bridge network, allows outbound connections
+    # For stricter control, you might define an internal network and a separate container for proxying API calls.
+    # internal: true # Uncomment if no external network access is needed from this container.
