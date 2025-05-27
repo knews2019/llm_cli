@@ -1,0 +1,33 @@
+#!/bin/bash
+# llm-safe - Main wrapper script to run LLM commands in Docker.
+set -e
+
+# Check if docker-compose is available
+if ! command -v docker-compose &> /dev/null; then
+    if ! command -v docker compose &> /dev/null; then # Check for 'docker compose' (v2)
+        echo "Error: docker-compose (or docker compose) is required but not found."
+        echo "Please install Docker Desktop or Docker Engine with Compose plugin."
+        exit 1
+    fi
+    # Use 'docker compose' if 'docker-compose' is not found
+    COMPOSE_CMD="docker compose"
+else
+    COMPOSE_CMD="docker-compose"
+fi
+
+# Get the directory of the script to find docker-compose.yml relative to it
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")" # Assumes scripts/ is one level down
+
+# Ensure the script is run from the project root or that docker-compose.yml can be found
+if [ ! -f "${PROJECT_ROOT}/docker-compose.yml" ]; then
+    echo "Error: docker-compose.yml not found in ${PROJECT_ROOT}."
+    echo "Please run this script from within the project directory or ensure the paths are correct."
+    exit 1
+fi
+
+# Echo "Running LLM command in Docker with: $@"
+# The --rm flag ensures the container is removed after execution.
+# The --service-ports flag is generally not needed for a CLI tool unless it starts a service.
+# Pass all arguments ("$@") to the llm command inside the container.
+(cd "$PROJECT_ROOT" && $COMPOSE_CMD run --rm llm "$@")
