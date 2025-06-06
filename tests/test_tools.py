@@ -3,7 +3,7 @@ from click.testing import CliRunner
 from importlib.metadata import version
 import json
 import llm
-from llm import cli
+from llm import cli, CancelToolCall
 from llm.migrations import migrate
 from llm.tools import llm_time
 import os
@@ -239,6 +239,24 @@ def test_default_tool_llm_version():
     assert '"output": "{}"'.format(version("llm")) in result.output
 
 
+def test_functions_tool_locals():
+    # https://github.com/simonw/llm/issues/1107
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.cli,
+        [
+            "-m",
+            "echo",
+            "--functions",
+            "my_locals = locals",
+            "-T",
+            "llm_version",
+            json.dumps({"tool_calls": [{"name": "locals"}]}),
+        ],
+    )
+    assert result.exit_code == 0
+
+
 def test_default_tool_llm_time():
     runner = CliRunner()
     result = runner.invoke(
@@ -264,3 +282,228 @@ def test_default_tool_llm_time():
         "utc_time",
         "is_dst",
     }
+
+
+def test_incorrect_tool_usage():
+    model = llm.get_model("echo")
+
+    def simple(name: str):
+        return name
+
+    chain_response = model.chain(
+        json.dumps({"tool_calls": [{"name": "bad_tool"}]}),
+        tools=[simple],
+    )
+    output = chain_response.text()
+    assert 'Error: tool \\"bad_tool\\" does not exist' in output
+
+
+def test_tool_returning_attachment():
+    model = llm.get_model("echo")
+
+    def return_attachment() -> llm.Attachment:
+        return llm.ToolOutput(
+            "Output",
+            attachments=[
+                llm.Attachment(
+                    content=b"This is a test attachment",
+                    type="image/png",
+                )
+            ],
+        )
+
+    chain_response = model.chain(
+        json.dumps({"tool_calls": [{"name": "return_attachment"}]}),
+        tools=[return_attachment],
+    )
+    output = chain_response.text()
+    assert '"type": "image/png"' in output
+    assert '"output": "Output"' in output
+
+
+@pytest.mark.asyncio
+async def test_async_tool_returning_attachment():
+    model = llm.get_async_model("echo")
+
+    async def return_attachment() -> llm.Attachment:
+        return llm.ToolOutput(
+            "Output",
+            attachments=[
+                llm.Attachment(
+                    content=b"This is a test attachment",
+                    type="image/png",
+                )
+            ],
+        )
+
+    chain_response = model.chain(
+        json.dumps({"tool_calls": [{"name": "return_attachment"}]}),
+        tools=[return_attachment],
+    )
+    output = await chain_response.text()
+    assert '"type": "image/png"' in output
+    assert '"output": "Output"' in output
+
+
+def test_tool_conversation_settings():
+    model = llm.get_model("echo")
+    before_collected = []
+    after_collected = []
+
+    def before(*args):
+        before_collected.append(args)
+
+    def after(*args):
+        after_collected.append(args)
+
+    conversation = model.conversation(
+        tools=[llm_time], before_call=before, after_call=after
+    )
+    # Run two things
+    conversation.chain(json.dumps({"tool_calls": [{"name": "llm_time"}]})).text()
+    conversation.chain(json.dumps({"tool_calls": [{"name": "llm_time"}]})).text()
+    assert len(before_collected) == 2
+    assert len(after_collected) == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_conversation_settings_async():
+    model = llm.get_async_model("echo")
+    before_collected = []
+    after_collected = []
+
+    async def before(*args):
+        before_collected.append(args)
+
+    async def after(*args):
+        after_collected.append(args)
+
+    conversation = model.conversation(
+        tools=[llm_time], before_call=before, after_call=after
+    )
+    await conversation.chain(json.dumps({"tool_calls": [{"name": "llm_time"}]})).text()
+    await conversation.chain(json.dumps({"tool_calls": [{"name": "llm_time"}]})).text()
+    assert len(before_collected) == 2
+    assert len(after_collected) == 2
+
+
+ERROR_FUNCTION = """
+def trigger_error(msg: str):
+    raise Exception(msg)
+"""
+
+
+@pytest.mark.parametrize("async_", (False, True))
+def test_tool_errors(async_):
+    # https://github.com/simonw/llm/issues/1107
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.cli,
+        (
+            [
+                "-m",
+                "echo",
+                "--functions",
+                ERROR_FUNCTION,
+                json.dumps(
+                    {
+                        "tool_calls": [
+                            {"name": "trigger_error", "arguments": {"msg": "Error!"}}
+                        ]
+                    }
+                ),
+            ]
+            + (["--async"] if async_ else [])
+        ),
+    )
+    assert result.exit_code == 0
+    assert '"output": "Error: Error!"' in result.output
+    # llm logs --json output
+    log_json_result = runner.invoke(cli.cli, ["logs", "--json", "-c"])
+    assert log_json_result.exit_code == 0
+    log_data = json.loads(log_json_result.output)
+    assert len(log_data) == 2
+    assert log_data[1]["tool_results"][0]["exception"] == "Exception: Error!"
+    # llm logs -c output
+    log_text_result = runner.invoke(cli.cli, ["logs", "-c"])
+    assert log_text_result.exit_code == 0
+    assert (
+        "- **trigger_error**: `None`<br>\n"
+        "    Error: Error!<br>\n"
+        "    **Error**: Exception: Error!\n"
+    ) in log_text_result.output
+
+
+def test_chain_sync_cancel_only_first_of_two():
+    model = llm.get_model("echo")
+
+    def t1() -> str:
+        return "ran1"
+
+    def t2() -> str:
+        return "ran2"
+
+    def before(tool, tool_call):
+        if tool.name == "t1":
+            raise CancelToolCall("skip1")
+        # allow t2
+        return None
+
+    calls = [
+        {"name": "t1"},
+        {"name": "t2"},
+    ]
+    payload = json.dumps({"tool_calls": calls})
+    chain = model.chain(payload, tools=[t1, t2], before_call=before)
+    _ = chain.text()
+
+    # second response has two results
+    second = chain._responses[1]
+    results = second.prompt.tool_results
+    assert len(results) == 2
+
+    # first cancelled, second executed
+    assert results[0].name == "t1"
+    assert results[0].output == "Cancelled: skip1"
+    assert isinstance(results[0].exception, CancelToolCall)
+
+    assert results[1].name == "t2"
+    assert results[1].output == "ran2"
+    assert results[1].exception is None
+
+
+# 2c async equivalent
+@pytest.mark.asyncio
+async def test_chain_async_cancel_only_first_of_two():
+    async_model = llm.get_async_model("echo")
+
+    def t1() -> str:
+        return "ran1"
+
+    async def t2() -> str:
+        return "ran2"
+
+    async def before(tool, tool_call):
+        if tool.name == "t1":
+            raise CancelToolCall("skip1")
+        return None
+
+    calls = [
+        {"name": "t1"},
+        {"name": "t2"},
+    ]
+    payload = json.dumps({"tool_calls": calls})
+    chain = async_model.chain(payload, tools=[t1, t2], before_call=before)
+    _ = await chain.text()
+
+    second = chain._responses[1]
+    results = second.prompt.tool_results
+    assert len(results) == 2
+
+    assert results[0].name == "t1"
+    assert results[0].output == "Cancelled: skip1"
+    assert isinstance(results[0].exception, CancelToolCall)
+
+    assert results[1].name == "t2"
+    assert results[1].output == "ran2"
+    assert results[1].exception is None
